@@ -17,37 +17,20 @@ module ObjectDaddy
     attr_reader :presence_validated_attributes
     protected :exemplars_generated=
     
-    # create a valid instance of this class, using any known generators
+    # :call-seq:
+    #   spawn()
+    #   spawn() do |obj| ... end
+    #   spawn(args)
+    #   spawn(args) do |obj| ... end
+    #
+    # Creates a valid instance of this class, using any known generators. The
+    # generated instance is yielded to a block if provided.
     def spawn(args = {})
       gather_exemplars
-      (generators || {}).each_pair do |handle, gen_data|
-        next if args[handle]
-        generator = gen_data[:generator]
-        if generator[:block]
-          if generator[:start]
-            generator[:prev] = args[handle] = generator[:start]
-            generator.delete(:start)
-          else
-            generator[:prev] = args[handle] = generator[:block].call(generator[:prev])
-          end
-        elsif generator[:method]
-          args[handle] = send(generator[:method])
-        elsif generator[:class]
-          args[handle] = generator[:class].next
-        end
-      end
-      if presence_validated_attributes
-        req = {}
-        (@presence_validated_attributes.keys - args.keys).each {|a| req[a.to_s] = true } # find attributes required by validates_presence_of not already set
-        
-        belongs_to_associations = reflect_on_all_associations(:belongs_to).to_a
-        missing = belongs_to_associations.select { |a|  req[a.name.to_s] or req[a.primary_key_name.to_s] }
-        if create_scope = scope(:create)
-          missing.reject! { |a|   create_scope.include?(a.primary_key_name) }
-        end
-        missing.each {|a| args[a.name] = a.class_name.constantize.generate }
-      end
-      new(args)
+      generate_values(args)
+      instance = new(args)
+      yield instance if block_given?
+      instance
     end
 
     # register a generator for an attribute of this class
@@ -76,8 +59,9 @@ module ObjectDaddy
       end
       
       if args[:method]
-        raise ArgumentError, "generator method :[#{args[:method]}] is not known" unless respond_to?(args[:method].to_sym)
-        record_generator_for(handle, :method => args[:method].to_sym)
+        h = { :method => args[:method].to_sym }
+        h[:start] = args[:start] if args[:start]
+        record_generator_for(handle, h)
       elsif args[:class]
         raise ArgumentError, "generator class [#{args[:class].name}] does not have a :next method" unless args[:class].respond_to?(:next)
         record_generator_for(handle, :class => args[:class])
@@ -102,7 +86,16 @@ module ObjectDaddy
       load(path) if File.exists?(path)
       self.exemplars_generated = true
     end
-  
+    
+    def presence_validated_attributes
+      @presence_validated_attributes ||= {}
+      attrs = @presence_validated_attributes
+      if superclass.respond_to?(:presence_validated_attributes)
+        attrs = superclass.presence_validated_attributes.merge(attrs)
+      end
+      attrs
+    end
+    
   protected
   
     # we define an underscore helper ourselves since the ActiveSupport isn't available if we're not using Rails
@@ -115,11 +108,60 @@ module ObjectDaddy
       raise ArgumentError, "a generator for attribute [:#{handle}] has already been specified" if (generators[handle] || {})[:source] == self
       generators[handle] = { :generator => generator, :source => self }
     end
+  
+  private
+    
+    def generate_values(args)
+      (generators || {}).each_pair do |handle, gen_data|
+        next if args.include?(handle)
+        
+        generator = gen_data[:generator]
+        if generator[:block]
+          process_generated_value(args, handle, generator, generator[:block])
+        elsif generator[:method]
+          method = method(generator[:method])
+          if method.arity == 1
+            process_generated_value(args, handle, generator, method)
+          else
+            args[handle] = method.call
+          end
+        elsif generator[:class]
+          args[handle] = generator[:class].next
+        end
+      end
+      
+      generate_missing(args)
+    end
+    
+    def process_generated_value(args, handle, generator, block)
+      if generator[:start]
+        value = generator[:start]
+        generator.delete(:start)
+      else
+        value = block.call(generator[:prev])
+      end
+      generator[:prev] = args[handle] = value
+    end
+    
+    def generate_missing(args)
+      if presence_validated_attributes and !presence_validated_attributes.empty?
+        req = {}
+        (presence_validated_attributes.keys - args.keys).each {|a| req[a.to_s] = true } # find attributes required by validates_presence_of not already set
+        
+        belongs_to_associations = reflect_on_all_associations(:belongs_to).to_a
+        missing = belongs_to_associations.select { |a|  req[a.name.to_s] or req[a.primary_key_name.to_s] }
+        if create_scope = scope(:create)
+          missing.reject! { |a|   create_scope.include?(a.primary_key_name) }
+        end
+        missing.each {|a| args[a.name] = a.class_name.constantize.generate }
+      end
+    end
   end
   
   module RailsClassMethods
     def exemplar_path
-      File.join(RAILS_ROOT, 'spec', 'exemplars')
+      dir = File.directory?(File.join(RAILS_ROOT, 'spec')) ? 'spec' : 'test'
+      File.join(RAILS_ROOT, dir, 'exemplars')
     end
     
     def validates_presence_of_with_object_daddy(*attr_names)
@@ -130,16 +172,40 @@ module ObjectDaddy
       validates_presence_of_without_object_daddy(*attr_names)
     end
     
+    # :call-seq:
+    #   generate()
+    #   generate() do |obj| ... end
+    #   generate(args)
+    #   generate(args) do |obj| ... end
+    #
+    # Creates and tries to save an instance of this class, using any known
+    # generators. The generated instance is yielded to a block if provided.
+    #
+    # This will not raise errors on a failed save. Use generate! if you
+    # want errors raised.
     def generate(args = {})
-      obj = spawn(args)
-      obj.save
-      obj
+      spawn(args) do |instance|
+        instance.save
+        yield instance if block_given?
+      end
     end
     
+    # :call-seq:
+    #   generate()
+    #   generate() do |obj| ... end
+    #   generate(args)
+    #   generate(args) do |obj| ... end
+    #
+    # Creates and tries to save! an instance of this class, using any known
+    # generators. The generated instance is yielded to a block if provided.
+    #
+    # This will raise errors on a failed save. Use generate if you do not want
+    # errors raised.
     def generate!(args = {})
-      obj = spawn(args)
-      obj.save!
-      obj
+      spawn(args) do |instance|
+        instance.save!
+        yield instance if block_given?
+      end
     end
   end
 end
